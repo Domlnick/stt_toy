@@ -1,0 +1,71 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Input audio files
+input/*
+!input/.gitkeep
+
+# Output files
+output/wav/*
+output/txt/*
+output/srt/*
+output/json/*
+output/md/*
+!output/wav/.gitkeep
+!output/txt/.gitkeep
+!output/srt/.gitkeep
+!output/json/.gitkeep
+!output/md/.gitkeep
+
+# Whisper models
+models/*
+!models/.gitkeep
+
+# whisper.cpp 소스/clone 은 저장소에 포함하지 않는다 (README 참고, 직접 clone)
+vendor/whisper.cpp/
+!vendor/.gitkeep
+
+# Build artifacts
+vendor/whisper.cpp/build/
+build/
+dist/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Audio conversion artifacts
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+
+# STT result artifacts
+*.srt
+*.vtt
+*.json
+*.txt
+# 의존성 목록은 예외로 커밋
+!requirements.txt
