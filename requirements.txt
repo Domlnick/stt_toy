@@ -6,6 +6,6 @@
 mlx-whisper>=0.4.0
 
 # (선택) 화자 구분(speaker diarization). 무거움(torch 동반) + HF 토큰 필요.
-# 안 쓰면 설치 불필요. 설치:
+# 안 쓰면 미설치여도 일반 STT 동작. 설치:
 #   python3 -m pip install --user "pyannote.audio>=3.1"
-# pyannote.audio>=3.1
+pyannote.audio>=3.1

@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +46,162 @@ WAV_DIR = PROJECT_ROOT / "output" / "wav"
 # 정확도를 더 원하면 mlx-community/whisper-large-v3-turbo (fp16).
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
 DEFAULT_LANG = "ko"
+
+# 환청(노이즈·무음을 텍스트로 지어내기, 같은 말 반복) 억제 옵션.
+#   condition_on_previous_text=False : 앞 (환청)텍스트에 안 휘둘려 반복 폭주 차단(가장 큼).
+#   temperature 폴백               : 저신뢰 구간 재디코딩.
+#   compression_ratio/logprob/no_speech : 반복·저신뢰·무음 구간 버림.
+# 이 세트는 안정적(word_timestamps 불필요).
+ANTI_HALLUC_BASE = {
+    "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+    "condition_on_previous_text": False,
+    "compression_ratio_threshold": 2.4,
+    "logprob_threshold": -1.0,
+    "no_speech_threshold": 0.6,
+}
+# 추가 억제(무음 길면 환청 스킵). word_timestamps 필요 → 일부 환경에서 numba 크래시.
+# 그래서 먼저 시도하고, 실패하면 BASE 만으로 폴백한다.
+ANTI_HALLUC_EXTRA = {
+    "hallucination_silence_threshold": 2.0,
+    "word_timestamps": True,
+}
+
+
+# ── Whisper 메타데이터 기반 노이즈/환청 사후필터 (VAD 독립, 타임스탬프 안전) ──
+# 의미 토큰만 추출(CJK/라틴/숫자). NFC 정규화로 한글 자모 분리 방지.
+_TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣぀-ヿ一-鿿]+")
+
+
+def _tokenize(text: str) -> list:
+    return _TOKEN_RE.findall(unicodedata.normalize("NFC", text))
+
+
+def repetition_score(text: str):
+    """(최대 연속반복, 중복비율). '이거 이거 이거'->(3, ...)."""
+    toks = _tokenize(text)
+    n = len(toks)
+    if n == 0:
+        return 0, 0.0
+    max_run = run = 1
+    for i in range(1, n):
+        run = run + 1 if toks[i] == toks[i - 1] else 1
+        if run > max_run:
+            max_run = run
+    return max_run, 1.0 - (len(set(toks)) / n)
+
+
+def is_repetitive(text: str, max_run_thr: int = 5,
+                  dup_ratio_thr: float = 0.6, min_tokens: int = 6) -> bool:
+    """반복 환청 여부.
+
+    - 연속반복(max_run)은 토큰수 무관 적용: 5연속이면 환청('고개를'×N).
+      정상 강조('네 네 네 네'=4)는 보존되게 임계 5.
+    - 중복비율(dup_ratio)은 짧은 정상 발화 오판 방지로 min_tokens 이상에서만.
+    """
+    toks = _tokenize(text)
+    n = len(toks)
+    if n == 0:
+        return False
+    max_run, dup_ratio = repetition_score(text)
+    if max_run >= max_run_thr:
+        return True
+    return n >= min_tokens and dup_ratio >= dup_ratio_thr
+
+
+def filter_low_confidence_segments(
+    segments: list,
+    *,
+    no_speech_thr: float = 0.6,
+    logprob_thr: float = -1.0,
+    compression_ratio_thr: float = 2.4,
+    min_text_len: int = 1,
+    return_dropped: bool = False,
+):
+    """노이즈/환청 세그먼트 제거(입력 불변). 규칙 OR:
+
+      R1 노이즈: no_speech_prob > thr AND avg_logprob < thr (둘 다 만족해야 — 보수적).
+                 발화가 있는 동시발화는 no_speech 가 낮아 안 걸림.
+      R2 압축률: compression_ratio > thr (반복 환청 시그니처).
+      R3 반복:   is_repetitive(text) ('이거 이거…').
+      R4 빈것:   토큰 0 또는 글자수 < min_text_len.
+    메타 키 없는 세그먼트는 보수적으로 보존.
+    """
+    kept, dropped = [], []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        nsp, alp, cr = (seg.get("no_speech_prob"), seg.get("avg_logprob"),
+                        seg.get("compression_ratio"))
+        reason = None
+        if len(_tokenize(text)) == 0 or len(text) < min_text_len:
+            reason = "empty"
+        elif (nsp is not None and alp is not None
+              and nsp > no_speech_thr and alp < logprob_thr):
+            reason = "noise"
+        elif cr is not None and cr > compression_ratio_thr:
+            reason = "compression"
+        elif is_repetitive(text):
+            reason = "repetition"
+        (dropped if reason else kept).append(seg)
+    return (kept, dropped) if return_dropped else kept
+
+
+def collapse_repeated_segments(segments: list, max_tokens: int = 4) -> list:
+    """연속된 동일-짧은-텍스트 세그먼트를 1개로 합친다(세그먼트 경계 넘는 반복 환청).
+
+    per-세그먼트 필터는 '불편함' 단일 토막이 여러 세그먼트로 흩어지면 못 잡는다.
+    바로 앞 통과 세그먼트와 토큰열이 같고 짧으면(<=max_tokens) 중복으로 보고 버린다.
+    정상 발화가 동일 짧은 문장을 연속 반복하는 일은 드물어 안전(첫 1개는 보존).
+    """
+    kept = []
+    prev_key = None
+    for s in segments:
+        toks = _tokenize(s.get("text") or "")
+        key = tuple(toks)
+        if toks and len(toks) <= max_tokens and key == prev_key:
+            continue  # 직전과 동일 짧은 텍스트 → 중복 제거
+        kept.append(s)
+        prev_key = key
+    return kept
+
+
+def filter_disabled() -> bool:
+    return os.environ.get("STT_FILTER", "1") in ("0", "false", "no")
+
+
+def apply_meta_filter(result: dict) -> None:
+    """Whisper 메타 기반 노이즈필터(B)를 result 에 적용(in place). 전멸 시 원본 유지."""
+    if filter_disabled():
+        return
+    segs = result.get("segments") or []
+    if not segs:
+        return
+    kept, dropped = filter_low_confidence_segments(segs, return_dropped=True)
+    kept = collapse_repeated_segments(kept)   # 세그먼트 경계 넘는 반복 정리
+    if not kept:
+        print(f"FILTER(meta) 전부 노이즈 판정 → 원본 유지({len(segs)})",
+              file=sys.stderr, flush=True)
+        return
+    if len(kept) != len(segs):
+        print(f"FILTER(meta) {len(segs)} → {len(kept)} segments",
+              file=sys.stderr, flush=True)
+        result["segments"] = kept
+        result["text"] = "".join(s.get("text", "") for s in kept)
+
+
+def transcribe_robust(mlx_whisper, audio: str, model: str, lang: str) -> dict:
+    """환청 억제 옵션으로 트랜스크라이브. word_timestamps 크래시 시 폴백."""
+    try:
+        return mlx_whisper.transcribe(
+            audio, path_or_hf_repo=model, language=lang, verbose=True,
+            **ANTI_HALLUC_BASE, **ANTI_HALLUC_EXTRA,
+        )
+    except Exception as exc:
+        # word_timestamps(numba) 등 실패 → 안정 옵션만으로 재시도.
+        print(f"(word_timestamps 비활성 폴백: {exc})", file=sys.stderr, flush=True)
+        return mlx_whisper.transcribe(
+            audio, path_or_hf_repo=model, language=lang, verbose=True,
+            **ANTI_HALLUC_BASE,
+        )
 
 
 def probe_duration(audio_path: Path) -> float:
@@ -147,23 +305,22 @@ def main() -> int:
     print("PHASE stt", flush=True)
     try:
         # verbose=True -> 세그먼트를 stdout 으로 실시간 출력 (서버가 파싱).
-        result = mlx_whisper.transcribe(
-            str(stt_input),
-            path_or_hf_repo=model,
-            language=lang,
-            verbose=True,
-        )
+        result = transcribe_robust(mlx_whisper, str(stt_input), model, lang)
     except Exception as exc:
         print(f"STT 실패: {exc}", file=sys.stderr)
         return 3
+
+    # B: Whisper 메타 기반 노이즈/환청 필터(항상, ON/OFF 공통).
+    apply_meta_filter(result)
 
     txt_body = None
     if diarize_on:
         try:
             txt_body = run_diarize_phase(stt_input, result)
         except Exception as exc:
-            # 화자 구분만 실패하면 STT 본문은 살린다(완전 실패 아님).
-            print(f"화자 구분 실패(텍스트만 저장): {exc}", file=sys.stderr)
+            # 화자 구분만 실패하면 STT 본문은 살리되, 실패 사실을 명확히 알린다.
+            # (조용히 일반 텍스트로 폴백하면 사용자가 화자 구분된 줄 착각함)
+            print(f"DIARIZE_ERROR {exc}", flush=True)
             txt_body = None
 
     try:
@@ -189,6 +346,20 @@ def run_diarize_phase(wav_path: Path, result: dict) -> str:
         str(wav_path), token=token, num_speakers=num_speakers,
     )
     segments = result.get("segments", []) or []
+
+    # A: VAD 사후필터 — 음성구간(turns)과 거의 안 겹치는 환청 제거(turns 재활용, 비용 0).
+    # B(메타) 다음 단계라 합집합 효과. 전멸 시 원본 유지. result 갱신으로 srt/json 도 일관.
+    if not filter_disabled():
+        speech_turns = [(t0, t1) for t0, t1, _ in turns]
+        filtered = diarize.filter_noise_segments(segments, speech_turns)
+        if filtered:
+            if len(filtered) != len(segments):
+                print(f"FILTER(vad) dropped {len(segments) - len(filtered)}/{len(segments)}",
+                      file=sys.stderr, flush=True)
+            segments = filtered
+            result["segments"] = segments
+            result["text"] = "".join(s.get("text", "") for s in segments)
+
     labeled = diarize.label_segments(segments, turns, overlaps)
     return diarize.build_diarized_text(labeled)
 

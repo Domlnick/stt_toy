@@ -17,6 +17,9 @@ venv/
 .env
 .env.*
 
+# Hugging Face 토큰 (화자 구분용) — 절대 커밋 금지
+.hf_token
+
 # Logs
 logs/
 *.log

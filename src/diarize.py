@@ -150,6 +150,11 @@ def run_diarization(
       overlaps = [(start, end), ...]  (2명 이상 동시)
     pyannote/torch 는 이 함수 안에서만 import 한다(없으면 명확한 에러).
     """
+    # 호환 shim: huggingface_hub 1.x 는 use_auth_token 인자를 제거했는데
+    # pyannote.audio 3.4.x 는 아직 그 인자를 hub 함수에 넘긴다 → 충돌.
+    # pyannote import 전에 hub 다운로드 함수를 감싸 use_auth_token→token 으로 변환한다.
+    _patch_hf_auth_token_kwarg()
+
     try:
         import torch
         from pyannote.audio import Pipeline
@@ -158,18 +163,32 @@ def run_diarization(
             "pyannote.audio/torch 미설치. 'pip3 install --user pyannote.audio' 실행."
         ) from exc
 
+    # PyTorch 2.6+ 호환: torch.load 기본값이 weights_only=True 로 바뀌어
+    # pyannote 체크포인트 로드가 깨진다. 공식 pyannote 모델이므로 False 로 강제한다.
+    _patch_torch_load_weights_only(torch)
+
     if not token:
         raise RuntimeError(
             "Hugging Face 토큰 없음. 환경변수 HF_TOKEN 설정 필요"
             "(pyannote/speaker-diarization-3.1 약관 동의 후 발급)."
         )
 
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=token,
-    )
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", use_auth_token=token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "모델 다운로드 실패. 다음을 확인하세요 — "
+            "(1) 두 모델 페이지에서 약관 동의(Agree): "
+            "huggingface.co/pyannote/segmentation-3.0, "
+            "huggingface.co/pyannote/speaker-diarization-3.1, "
+            "(2) 토큰이 gated repo 읽기 권한이 있는지(Classic Read 토큰 권장). "
+            f"원인: {exc}"
+        ) from exc
     if pipeline is None:
         raise RuntimeError(
-            "pyannote 파이프라인 로드 실패. 토큰/약관 동의 확인."
+            "pyannote 파이프라인 로드 실패. 토큰 또는 약관 동의(두 모델 페이지)를 확인하세요."
         )
 
     if prefer_mps:
@@ -197,6 +216,96 @@ def run_diarization(
         overlaps = _overlaps_from_turns(turns)  # 폴백: 직접 계산
 
     return turns, overlaps
+
+
+def _patch_hf_auth_token_kwarg() -> None:
+    """huggingface_hub 1.x 호환: use_auth_token 인자를 token 으로 변환하는 래퍼.
+
+    pyannote.audio 3.4.x 가 hub 함수에 use_auth_token 을 넘기는데, huggingface_hub
+    1.0+ 는 이 인자를 제거했다. pyannote import 전에 호출해 hub 함수를 감싼다.
+    (이미 호환되면 아무것도 하지 않는다.)
+    """
+    import inspect
+    import huggingface_hub as hh
+
+    for fname in ("hf_hub_download", "snapshot_download"):
+        fn = getattr(hh, fname, None)
+        if fn is None:
+            continue
+        try:
+            params = inspect.signature(fn).parameters
+        except (ValueError, TypeError):
+            continue
+        if "use_auth_token" in params or getattr(fn, "_stt_compat", False):
+            continue  # 이미 인자 지원하거나 이미 패치됨
+
+        def make_wrapper(orig):
+            def wrapper(*args, **kwargs):
+                if "use_auth_token" in kwargs:
+                    tok = kwargs.pop("use_auth_token")
+                    kwargs.setdefault("token", tok)
+                return orig(*args, **kwargs)
+            wrapper._stt_compat = True
+            return wrapper
+
+        setattr(hh, fname, make_wrapper(fn))
+
+
+def filter_noise_segments(
+    segments: List[dict],
+    speech_turns: List[Tuple[float, float]],
+    min_overlap_frac: float = 0.05,
+    collar: float = 0.0,
+) -> List[dict]:
+    """pyannote 음성 구간과 거의 안 겹치는 세그먼트를 노이즈로 보고 제거(VAD 사후필터).
+
+    각 세그먼트의 (음성구간과 겹친 총 시간 / 세그먼트 길이) < min_overlap_frac 이면 버린다.
+    타임스탬프는 손대지 않는다(사전 컷 아님 — 원본 start/end 유지).
+
+    speech_turns: turns 의 (start, end) 만. 빈 리스트면 거르지 않는다(안전 폴백).
+    collar:       음성구간을 양쪽으로 늘려 경계 누락 흡수(초). 기본 0.
+
+    근거(실측): 노이즈 세그먼트는 겹침 f=0.0, 실발화는 f>=0.17 → 0.05 임계로 분리,
+    실발화 쪽 3배 마진으로 false-negative(실발화 손실) 회피.
+    """
+    if not speech_turns:
+        return list(segments)  # 음성구간 모름 → 거르지 않음
+
+    kept: List[dict] = []
+    for s in segments:
+        start = float(s.get("start", 0.0))
+        end = float(s.get("end", start))
+        seg_len = end - start
+        if seg_len <= 0:
+            kept.append(s)  # 길이 0/역전 → 판단 불가, 보존
+            continue
+        total = 0.0
+        for t0, t1 in speech_turns:
+            total += _overlap_dur(start, end, t0 - collar, t1 + collar)
+            if total / seg_len >= min_overlap_frac:
+                break
+        if total / seg_len >= min_overlap_frac:
+            kept.append(s)
+    return kept
+
+
+def _patch_torch_load_weights_only(torch) -> None:
+    """torch.load 를 weights_only=False 로 강제(PyTorch 2.6+ 호환).
+
+    PyTorch 2.6 부터 torch.load 의 weights_only 기본값이 True 가 되어,
+    pyannote 가 저장한 체크포인트(TorchVersion 등 일반 객체 포함)를 못 읽는다.
+    공식 pyannote 모델만 로드하므로 안전상 허용 가능한 우회다.
+    """
+    if getattr(torch.load, "_stt_compat", False):
+        return
+    orig = torch.load
+
+    def patched(*args, **kwargs):
+        kwargs["weights_only"] = False
+        return orig(*args, **kwargs)
+
+    patched._stt_compat = True
+    torch.load = patched
 
 
 def _overlaps_from_turns(
