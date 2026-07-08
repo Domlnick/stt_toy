@@ -59,8 +59,22 @@ ANTI_HALLUC_BASE = {
     "logprob_threshold": -1.0,
     "no_speech_threshold": 0.6,
 }
-# 추가 억제(무음 길면 환청 스킵). word_timestamps 필요 → 일부 환경에서 numba 크래시.
-# 그래서 먼저 시도하고, 실패하면 BASE 만으로 폴백한다.
+
+# word_timestamps 기본 OFF (속도 2배). 예전엔 무음 환청 억제
+# (hallucination_silence_threshold)용으로 켰지만 DTW 정렬이 디코드를 2배로
+# 느리게 만들고, 그 방어 역할은 이제 silero-VAD(src/vad.py) 가 대신한다:
+#   - clip_timestamps 로 비발화 구간을 whisper 가 아예 건너뜀
+#   - 발화구간 밖 세그먼트를 사후필터로 제거(diarize.filter_noise_segments)
+# 정밀 단어 타임스탬프가 꼭 필요하면 STT_WORD_TS=1 로 되살린다(느려짐).
+def word_ts_enabled() -> bool:
+    return os.environ.get("STT_WORD_TS", "") in ("1", "true", "yes")
+
+
+def vad_enabled() -> bool:
+    return os.environ.get("STT_VAD", "1") not in ("0", "false", "no")
+
+
+# STT_WORD_TS=1 일 때만 쓰는 무음 환청 억제(word_timestamps 동반, 느림).
 ANTI_HALLUC_EXTRA = {
     "hallucination_silence_threshold": 2.0,
     "word_timestamps": True,
@@ -188,8 +202,42 @@ def apply_meta_filter(result: dict) -> None:
         result["text"] = "".join(s.get("text", "") for s in kept)
 
 
+def apply_vad_filter(result: dict, regions: list) -> None:
+    """silero-VAD 발화구간(regions)과 안 겹치는 세그먼트를 노이즈로 제거(in place).
+
+    word_timestamps 를 껐을 때 잃는 무음 환청 억제를 이 필터가 대신한다.
+    diarize.filter_noise_segments 재사용(타임스탬프 불변). 전멸 시 원본 유지.
+    diarize 경로는 pyannote turns 로 자체 필터하므로 여기선 건너뛴다.
+    """
+    if filter_disabled() or not regions:
+        return
+    import diarize
+    segs = result.get("segments") or []
+    if not segs:
+        return
+    filtered = diarize.filter_noise_segments(segs, regions)
+    if not filtered:
+        print(f"FILTER(vad) 전부 노이즈 판정 → 원본 유지({len(segs)})",
+              file=sys.stderr, flush=True)
+        return
+    if len(filtered) != len(segs):
+        print(f"FILTER(vad) {len(segs)} → {len(filtered)} segments",
+              file=sys.stderr, flush=True)
+        result["segments"] = filtered
+        result["text"] = "".join(s.get("text", "") for s in filtered)
+
+
 def transcribe_robust(mlx_whisper, audio: str, model: str, lang: str) -> dict:
-    """환청 억제 옵션으로 트랜스크라이브. word_timestamps 크래시 시 폴백."""
+    """환청 억제 옵션으로 트랜스크라이브.
+
+    기본은 word_timestamps OFF(빠름, ~2배). STT_WORD_TS=1 이면 무음 환청 억제용
+    (hallucination_silence_threshold)으로 켜되, numba 크래시 시 BASE 로 폴백한다.
+    """
+    if not word_ts_enabled():
+        return mlx_whisper.transcribe(
+            audio, path_or_hf_repo=model, language=lang, verbose=True,
+            **ANTI_HALLUC_BASE,
+        )
     try:
         return mlx_whisper.transcribe(
             audio, path_or_hf_repo=model, language=lang, verbose=True,
@@ -293,14 +341,36 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # 화자 구분 시 whisper/pyannote 가 같은 16kHz WAV 를 쓰도록 미리 변환.
+    # 16kHz WAV 로 미리 변환한다. VAD(silero)와, 화자 구분 시 pyannote 가
+    # 같은 입력을 쓴다. 변환 실패해도 원본으로 STT 는 진행(VAD 만 건너뜀).
     stt_input = audio_path
-    if diarize_on:
-        try:
-            stt_input = to_wav(audio_path)
-        except Exception as exc:
+    try:
+        stt_input = to_wav(audio_path)
+    except Exception as exc:
+        if diarize_on:  # 화자 구분은 WAV 필수 → 치명적
             print(f"WAV 변환 실패(ffmpeg 확인): {exc}", file=sys.stderr)
             return 3
+        print(f"WAV 변환 실패, 원본으로 STT 진행(VAD 생략): {exc}",
+              file=sys.stderr, flush=True)
+
+    # silero-VAD 발화구간 검출. 노이즈/환청 사후필터 전용으로 쓴다.
+    #
+    # 주의: 예전엔 이 구간을 clip_timestamps 로 whisper 에 넘겨 비발화 구간을
+    # 건너뛰게 했으나, 이 mlx_whisper build 는 clip 경계 seek 을 나쁘게 처리해
+    # 환청 무한반복('나랑 나랑…')에 빠졌다(실측: 무클립 56s → clip 499s, 9배 악화).
+    # → clip_timestamps 는 쓰지 않는다. 발화구간은 필터에만 재활용.
+    regions: list = []
+    if vad_enabled() and stt_input != audio_path:
+        try:
+            import vad as vad_mod
+            regions, total_dur, speech_dur = vad_mod.speech_segments(stt_input)
+            frac = speech_dur / total_dur if total_dur else 1.0
+            print(f"VAD speech {speech_dur:.0f}/{total_dur:.0f}s "
+                  f"({frac * 100:.0f}%), {len(regions)} regions",
+                  file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"VAD 실패, 필터 생략: {exc}", file=sys.stderr, flush=True)
+            regions = []
 
     print("PHASE stt", flush=True)
     try:
@@ -312,6 +382,9 @@ def main() -> int:
 
     # B: Whisper 메타 기반 노이즈/환청 필터(항상, ON/OFF 공통).
     apply_meta_filter(result)
+    # A': silero-VAD 사후필터. diarize 경로는 pyannote turns 로 자체 필터하므로 제외.
+    if not diarize_on:
+        apply_vad_filter(result, regions)
 
     txt_body = None
     if diarize_on:

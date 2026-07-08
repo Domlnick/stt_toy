@@ -5,6 +5,13 @@
 #   python3 -m pip install --user mlx-whisper
 mlx-whisper>=0.4.0
 
+# VAD(음성구간 검출, src/vad.py). 발화구간 밖 환청/노이즈 세그먼트를 걸러
+# word_timestamps 없이도 환청을 억제한다(word_timestamps off 로 속도 2배).
+# 경량(torch 기반). 설치:
+#   python3 -m pip install --user silero-vad
+# 미설치 시 자동으로 전체 처리로 폴백(STT 는 동작). 끄려면 STT_VAD=0.
+silero-vad>=5.1
+
 # (선택) 화자 구분(speaker diarization). 무거움(torch 동반) + HF 토큰 필요.
 # 안 쓰면 미설치여도 일반 STT 동작. 설치:
 #   python3 -m pip install --user "pyannote.audio>=3.1"
